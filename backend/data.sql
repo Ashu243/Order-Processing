@@ -94,6 +94,6 @@ RETURNING *;
 INSERT INTO order_items
 (order_id, product_id, quantity, price)
 VALUES
-(2, 4, 1, 12999.00),
-(2, 3, 1, 1499.00),
-(2, 5, 1, 1899.00);
+(3, 4, 1, 12999.00),
+(3, 3, 1, 1499.00),
+(3, 5, 1, 1899.00);
