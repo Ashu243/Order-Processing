@@ -97,3 +97,8 @@ VALUES
 (3, 4, 1, 12999.00),
 (3, 3, 1, 1499.00),
 (3, 5, 1, 1899.00);
+
+CREATE TABLE processed_events (
+    event_id VARCHAR(100) PRIMARY KEY,
+    processed_at TIMESTAMP DEFAULT NOW()
+);
