@@ -1,6 +1,6 @@
 const { Pool } = require('pg');
 require('dotenv').config();
-const { createClient } = require('redis')
+const { createClient } = require('redis');
 
 const pool = new Pool({
     user: process.env.DB_USER,
@@ -11,122 +11,262 @@ const pool = new Pool({
     max: 20,
 });
 
-pool.connect()
-    .then((client) => {
-        console.log('Postgres actually connected!');
-        client.release();
-    })
-    .catch((error) => {
-        console.error('Database connection error:', error);
-    });
-
 const redisClient = createClient({
     url: 'redis://localhost:6379'
-})
+});
 
 redisClient.on('error', (error) => {
-    console.error('Redis error:', error)
-})
+    console.error('Redis error:', error);
+});
 
-const consumerName = process.argv[2] || 'worker-1'
+const STREAM_NAME = 'order';
+const GROUP_NAME = 'order-workers';
+const consumerName = process.argv[2] || 'worker-1';
+
+// Don't make this too small.
+// If normal processing can take 2-3 seconds,
+// 30 seconds gives you some breathing room.
+const RECOVERY_IDLE_TIME = 30000;
+
+
+// --------------------------------------------------
+// PROCESS MESSAGE
+// --------------------------------------------------
+
+async function processMessage(message) {
+    const messageID = message.id;
+    const orderId = message.message.orderId;
+
+    const client = await pool.connect();
+
+    try {
+        await client.query('BEGIN');
+
+        // Check whether this event has already been processed
+        const processedEventResult = await client.query(
+            `SELECT 1
+             FROM processed_events
+             WHERE event_id = $1`,
+            [messageID]
+        );
+
+        if (processedEventResult.rows.length > 0) {
+            console.log('Already processed:', messageID);
+
+            await client.query('ROLLBACK');
+
+            // Safe to ACK because DB says this event
+            // was already successfully processed.
+            await redisClient.xAck(
+                STREAM_NAME,
+                GROUP_NAME,
+                messageID
+            );
+
+            return;
+        }
+
+        // Process the order
+        const orderUpdate = await client.query(
+            `UPDATE orders
+             SET status = 'CONFIRMED'
+             WHERE id = $1`,
+            [orderId]
+        );
+
+        if (orderUpdate.rows.length === 0) {
+            console.log('Order not found:', orderId);
+
+            await client.query('ROLLBACK');
+
+            // Don't ACK.
+            // Message will remain pending and can be retried.
+            return;
+        }
+
+        // Record successful processing
+        await client.query(
+            `INSERT INTO processed_events (event_id)
+             VALUES ($1)`,
+            [messageID]
+        );
+
+        // DB work is now atomic
+        await client.query('COMMIT');
+
+        // ACK only AFTER DB commit
+        await redisClient.xAck(
+            STREAM_NAME,
+            GROUP_NAME,
+            messageID
+        );
+
+        console.log(
+            `Processed order ${orderId}, event ${messageID}`
+        );
+
+    } catch (error) {
+
+        try {
+            await client.query('ROLLBACK');
+        } catch (rollbackError) {
+            console.error(
+                'Rollback failed:',
+                rollbackError
+            );
+        }
+
+        console.error(
+            `Error processing message ${messageID}:`,
+            error
+        );
+
+        // IMPORTANT:
+        // Don't ACK here.
+        //
+        // The message stays pending.
+        // Recovery can claim it later.
+
+    } finally {
+        client.release();
+    }
+}
+
+
+// --------------------------------------------------
+// NORMAL WORKER
+// --------------------------------------------------
 
 async function startWorker() {
-    await redisClient.connect()
-    console.log('Order Worker Started!!')
+    console.log(`Starting worker: ${consumerName}`);
 
-
-    // let lastID = '0' // if the worker crashes and started again it will return the order which have id greater than '0', so that is the limitation
     while (true) {
-        const result = await redisClient.xReadGroup(
-            'order-workers',
-            consumerName,
-            {
-                key: 'order',
-                id: '>' // Give me new messages that have never been delivered to another consumer in this group.
-            },
-            {
-                COUNT: 1,
-                BLOCK: 0
-            }
-        ) // "Read messages from the orders stream, starting from ID lastID. Give me up to 1 message, and if there isn't one, wait until a message arrives."
-        
-        const messageID = result[0].messages[0].id
-        
-        const processedEventResult = await client.query(`select 1 from processed_events
-            where event_id = $1`, [messageID])
-            
-            if (processedEventResult.rows.length > 0) {
-                console.log('Already Processed', messageID)
-                await redisClient.xAck(
-                    'order',
-                    'order-workers',
-                    messageID
-                )
-                continue
-            }
-            const client = await pool.connect()
-            try {
-            const orderId = result[0].messages[0].message.orderId
+        try {
+            const result = await redisClient.xReadGroup(
+                GROUP_NAME,
+                consumerName,
+                {
+                    key: STREAM_NAME,
+                    id: '>'
+                },
+                {
+                    COUNT: 1,
+                    BLOCK: 5000 // if no message after 5 sec then return null
+                }
+            );
 
-            await client.query('BEGIN')
-
-            const orderUpdate = await client.query(`update orders set status = 'CONFIRMED' where id = $1`, [orderId])
-
-            if (orderUpdate.rows.length === 0) {
-                console.log('Order not found:', orderId)
-                await client.query('ROLLBACK')
-                continue
+            // BLOCK can return null when it times out.
+            if (!result) {
+                continue;
             }
 
-            await client.query(`insert into processed_events (event_id)
-                values ($1)`, [messageID])
-            console.log(JSON.stringify(result, null, 2))
+            const messages = result[0]?.messages || [];
 
-            await client.query('COMMIT')
-
-            await redisClient.xAck(
-                'order',
-                'order-workers',
-                messageID
-            )
+            for (const message of messages) {
+                await processMessage(message);
+            }
 
         } catch (error) {
-            await client.query('ROLLBACK')
-            console.log('Error while processing orders', error)
-        }
-        finally {
-            await client.release()
+            console.error(
+                'Worker error:',
+                error
+            );
+
+            // Don't kill the worker because of
+            // a temporary Redis/DB error.
+            await new Promise(resolve =>
+                setTimeout(resolve, 1000)
+            );
         }
     }
 }
 
-// recover the data if the idle time of data is more than our expected time
+
+// --------------------------------------------------
+// RECOVER PENDING MESSAGES
+// --------------------------------------------------
+
 async function recoverPendingMessages() {
-    const pending = await redisClient.xPendingRange(
-        'order',
-        'order-workers',
-        '-',
-        '+',
-        10
-    )
+    try {
 
-    for (const message of pending) {
-        if (message.millisecondsSinceLastDelivery > 5000) {
-            const claimed = await redisClient.xClaim(
-                'order',
-                'order-workers',
-                consumerName,
-                5000,
-                [message.id]
-            )
+        const result = await redisClient.xAutoClaim(
+            STREAM_NAME,
+            GROUP_NAME,
+            consumerName,
+            RECOVERY_IDLE_TIME,
+            '0-0',
+            {
+                COUNT: 10
+            }
+        );
 
-            console.log('Recovered:', claimed)
+        const claimedMessages = result.messages;
+
+        if (claimedMessages.length === 0) {
+            return;
         }
+
+        console.log(
+            `Recovered ${claimedMessages.length} message(s)`
+        );
+
+        for (const message of claimedMessages) {
+            console.log(
+                'Processing recovered message:',
+                message.id
+            );
+
+            await processMessage(message);
+        }
+
+    } catch (error) {
+        console.error(
+            'Recovery error:',
+            error
+        );
     }
 }
 
-startWorker()
 
-setInterval(() => {
-    recoverPendingMessages()
-}, 5000);
+// --------------------------------------------------
+// START APPLICATION
+// --------------------------------------------------
+
+async function start() {
+    try {
+        await pool.query('SELECT 1');
+
+        console.log(
+            'Postgres actually connected!'
+        );
+
+        await redisClient.connect();
+
+        console.log(
+            'Redis connected!'
+        );
+
+        console.log(
+            `Order Worker Started: ${consumerName}`
+        );
+
+        // Start normal worker
+        startWorker();
+
+        // Recovery loop
+        setInterval(
+            recoverPendingMessages,
+            10000
+        );
+
+    } catch (error) {
+        console.error(
+            'Failed to start worker:',
+            error
+        );
+
+        process.exit(1);
+    }
+}
+
+start();
