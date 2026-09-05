@@ -35,7 +35,8 @@ const RECOVERY_IDLE_TIME = 30000;
 
 async function processMessage(message) {
     const messageID = message.id;
-    const orderId = message.message.orderId;
+    const orderId = message.message.orderID;
+
 
     const client = await pool.connect();
 
@@ -74,7 +75,8 @@ async function processMessage(message) {
             [orderId]
         );
 
-        if (orderUpdate.rows.length === 0) {
+        // console.log(orderUpdate)
+        if (orderUpdate.rowCount === 0) {
             console.log('Order not found:', orderId);
 
             await client.query('ROLLBACK');
@@ -94,6 +96,8 @@ async function processMessage(message) {
         // DB work is now atomic
         await client.query('COMMIT');
 
+        // await client.query('some randome bullshit')
+        // await new Promise(resolve => setTimeout(resolve, 40000))
         // ACK only AFTER DB commit
         await redisClient.xAck(
             STREAM_NAME,

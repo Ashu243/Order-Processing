@@ -42,10 +42,12 @@ app.post('/orders/:id', async (req, res) => {
             values ($1, $2, $3, $4)
             `, [order.id, id, 1, price])
         
+        await client.query(`insert into outbox_orders (order_id) values ($1)`, [order.id])
+        
         await client.query('COMMIT')
 
         // add the order to redis streams
-        redisClient.xAdd('order', '*', {event: 'order.created', orderID: order.id.toString()})
+        // redisClient.xAdd('order', '*', {event: 'order.created', orderID: order.id.toString()})
 
         return res.status(201).json({
             message: 'Order Created',

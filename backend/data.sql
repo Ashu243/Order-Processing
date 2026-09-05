@@ -15,6 +15,19 @@ CREATE TABLE orders (
     FOREIGN KEY (user_id)
         REFERENCES users(id)
 );
+
+CREATE TABLE outbox_orders (
+    id SERIAL PRIMARY KEY,
+    order_id INT NOT NULL,
+    status VARCHAR(50) NOT NULL DEFAULT 'TO_BE_PUBLISHED',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    event_type VARCHAR(50) NOT NULL DEFAULT 'ORDER_CREATED',
+
+    FOREIGN KEY (order_id)
+    REFERENCES orders(id)
+);
+
+
 CREATE TABLE products (
     id SERIAL PRIMARY KEY,
     name VARCHAR(255) NOT NULL,
