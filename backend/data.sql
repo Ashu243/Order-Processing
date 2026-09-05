@@ -27,6 +27,13 @@ CREATE TABLE outbox_orders (
     REFERENCES orders(id)
 );
 
+CREATE TABLE message_failures (
+    event_id VARCHAR(100) PRIMARY KEY,
+    retry_count INT NOT NULL DEFAULT 0,
+    last_error TEXT,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 
 CREATE TABLE products (
     id SERIAL PRIMARY KEY,

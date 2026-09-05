@@ -93,10 +93,10 @@ async function processMessage(message) {
             [messageID]
         );
 
+        await client.query('some randome bullshit')
         // DB work is now atomic
         await client.query('COMMIT');
 
-        // await client.query('some randome bullshit')
         // await new Promise(resolve => setTimeout(resolve, 40000))
         // ACK only AFTER DB commit
         await redisClient.xAck(
@@ -113,6 +113,38 @@ async function processMessage(message) {
 
         try {
             await client.query('ROLLBACK');
+
+            await client.query(`INSERT INTO message_failures (
+                event_id,
+                retry_count,
+                last_error,
+                updated_at
+                )
+                VALUES ($1, 1, $2, CURRENT_TIMESTAMP)
+                ON CONFLICT (event_id)
+                DO UPDATE SET
+                retry_count = message_failures.retry_count + 1,
+                last_error = EXCLUDED.last_error,
+                updated_at = CURRENT_TIMESTAMP;
+                `, [messageID, error.message]) // If this event already exists, don't create another row. Update the existing row instead.
+
+            const result = await client.query('select retry_count from message_failures where event_id = $1', [messageID])
+            const retryCount = result.rows[0].retry_count
+
+            if (retryCount >= 3) {
+                await redisClient.xAdd('order-dlq', '*', {
+                    originalEventId: messageID,
+                    orderID: message.message.orderID,
+                    retryCount: retryCount.toString(),
+                    error: error.message
+                })
+
+                await redisClient.xAck(
+                    STREAM_NAME,
+                    GROUP_NAME,
+                    messageID
+                )
+            }
         } catch (rollbackError) {
             console.error(
                 'Rollback failed:',
