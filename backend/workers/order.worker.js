@@ -93,7 +93,7 @@ async function processMessage(message) {
             [messageID]
         );
 
-        await client.query('some randome bullshit')
+        // await client.query('some randome bullshit')
         // DB work is now atomic
         await client.query('COMMIT');
 
