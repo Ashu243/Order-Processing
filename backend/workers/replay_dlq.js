@@ -2,19 +2,8 @@
 // 2 add that msg to the order
 // 3 if successfully added that msg, remove that from dlq
 
-
-const { Pool } = require('pg');
-require('dotenv').config();
 const { createClient } = require('redis');
 
-const pool = new Pool({
-    user: process.env.DB_USER,
-    host: process.env.DB_HOST,
-    database: process.env.DB_NAME,
-    password: process.env.DB_PASSWORD,
-    port: 5433,
-    max: 20,
-});
 
 const redisClient = createClient({
     url: 'redis://localhost:6379'
@@ -26,7 +15,60 @@ redisClient.on('error', (error) => {
 
 const event_id = process.argv[2]
 
-async function process_failed_messages(){
-    const event = await redisClient.xRange('order-dlq', event_id, event_id)
-    
+async function process_failed_messages() {
+    const messages = await redisClient.xRange('order-dlq', event_id, event_id)
+
+    if (messages.length === 0) {
+        console.log(`Event ${event_id} not found in DLQ`);
+        return;
+    }
+
+    const message = messages[0];
+
+    try {
+        const newId = await redisClient.xAdd(
+            'order',
+            '*',
+            {
+                event: 'order.created',
+                orderID: message.message.orderID
+            }
+        );
+
+        console.log(`Requeued ${message.id} as ${newId}`)
+
+        await redisClient.xDel('order-dlq', message.id)
+
+        console.log(
+            `Removed ${message.id} from DLQ`
+        );
+    } catch (error) {
+        console.log('Error while Requeing the message', error)
+    }
+
 }
+
+
+async function start() {
+    try {
+        await redisClient.connect();
+
+        console.log(
+            'Redis connected!'
+        );
+
+        // Start normal worker
+        startWorker();
+
+
+    } catch (error) {
+        console.error(
+            'Failed to start worker:',
+            error
+        );
+
+        process.exit(1);
+    }
+}
+
+start();
