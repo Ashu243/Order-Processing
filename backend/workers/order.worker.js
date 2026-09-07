@@ -37,6 +37,7 @@ async function processMessage(message) {
     const messageID = message.id;
     const orderId = message.message.orderID;
 
+    const event_id = `order-${orderId}`
 
     const client = await pool.connect();
 
@@ -48,11 +49,11 @@ async function processMessage(message) {
             `SELECT 1
              FROM processed_events
              WHERE event_id = $1`,
-            [messageID]
+            [event_id]
         );
 
         if (processedEventResult.rows.length > 0) {
-            console.log('Already processed:', messageID);
+            console.log('Already processed:', event_id);
 
             await client.query('ROLLBACK');
 
@@ -90,7 +91,7 @@ async function processMessage(message) {
         await client.query(
             `INSERT INTO processed_events (event_id)
              VALUES ($1)`,
-            [messageID]
+            [event_id]
         );
 
         // await client.query('some randome bullshit')
@@ -106,13 +107,15 @@ async function processMessage(message) {
         );
 
         console.log(
-            `Processed order ${orderId}, event ${messageID}`
+            `Processed order ${orderId}, event ${event_id}`
         );
 
     } catch (error) {
 
         try {
             await client.query('ROLLBACK');
+
+            await client.query('BEGIN')
 
             await client.query(`INSERT INTO message_failures (
                 event_id,
@@ -126,14 +129,16 @@ async function processMessage(message) {
                 retry_count = message_failures.retry_count + 1,
                 last_error = EXCLUDED.last_error,
                 updated_at = CURRENT_TIMESTAMP;
-                `, [messageID, error.message]) // If this event already exists, don't create another row. Update the existing row instead.
+                `, [event_id, error.message]) // If this event already exists, don't create another row. Update the existing row instead.
 
-            const result = await client.query('select retry_count from message_failures where event_id = $1', [messageID])
+            const result = await client.query('select retry_count from message_failures where event_id = $1', [event_id])
             const retryCount = result.rows[0].retry_count
+
+            await client.query("COMMIT")
 
             if (retryCount >= 3) {
                 await redisClient.xAdd('order-dlq', '*', {
-                    originalEventId: messageID,
+                    originalEventId: event_id,
                     orderID: message.message.orderID,
                     retryCount: retryCount.toString(),
                     error: error.message
@@ -153,7 +158,7 @@ async function processMessage(message) {
         }
 
         console.error(
-            `Error processing message ${messageID}:`,
+            `Error processing message ${event_id}:`,
             error
         );
 
