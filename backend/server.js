@@ -5,13 +5,73 @@ const app = express()
 
 const PORT = process.env.PORT || 3000
 
+app.use(express.json())
+app.use(express.urlencoded())
 
 app.get('/', (req, res) => {
     res.send('All Good')
 })
 
+app.get('/metrics', async(req, res)=>{
+    // const response1 = await redisClient.hSet('metrics', {
+    //     'order_created': 0,
+    //     'order_confirmed': 0,
+    //     'messages_failed': 0 
+    // })
+    // // console.log(response1)
+    // return res.json({
+    //     result: response1
+    // })
+
+    const result = await redisClient.hGetAll('metrics')
+    const pendingMessages = await redisClient.xPending('order', 'order-workers')
+    const dlq_messages = await redisClient.XLEN('order-dlq')
+    return res.json({
+        result,
+        pendingMessages: pendingMessages.pending,
+        dlq_messages
+    })
+})
+
+app.get('/health', async (req, res) => {
+    let isPostgreUp = 'down'
+    let isRedisUp = 'down'
+    try {
+        await pool.query('SELECT 1')
+        isPostgreUp = 'up'
+    } catch (error) {
+        isPostgreUp = 'down'
+    }
+    try {
+        const redisResult = await redisClient.ping()
+
+        if (redisResult === 'PONG') {
+            isRedisUp = 'up'
+        }
+    } catch (error) {
+        isRedisUp = 'down'
+    }
+    let status = 'unhealthy'
+    let statuscode = 503
+
+    if (isPostgreUp === 'up' && isRedisUp === 'up') {
+        status = 'healthy'
+        statuscode = 200
+    }
+
+    return res.status(statuscode)
+    .json({
+        status,
+        services: {
+            isPostgreUp,
+            isRedisUp
+        }
+    })
+})
+
 app.post('/orders/:id', async (req, res) => {
     const { id } = req.params
+    const {quantity} = req.body
     const user_id = 1
     const client = await pool.connect()
     try {
@@ -40,13 +100,13 @@ app.post('/orders/:id', async (req, res) => {
         // create order item
         await client.query(`insert into order_items (order_id, product_id, quantity, price)
             values ($1, $2, $3, $4)
-            `, [order.id, id, 1, price])
-        
+            `, [order.id, id, quantity, price])
+
         // 
         await client.query(`insert into outbox_orders (order_id) values ($1)`, [order.id])
-        
-        await client.query('COMMIT')
 
+        await client.query('COMMIT')
+        await redisClient.hIncrBy('metrics', 'order_created', 1)
         // add the order to redis streams
         // redisClient.xAdd('order', '*', {event: 'order.created', orderID: order.id.toString()})
 
@@ -62,6 +122,8 @@ app.post('/orders/:id', async (req, res) => {
         res.status(500).json({
             message: 'Failed to create order'
         });
+
+        await redisClient.hIncrBy('metrics', 'messages_failed', 1)
     }
     finally {
         client.release()

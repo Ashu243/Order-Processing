@@ -20,7 +20,7 @@ redisClient.on('error', (error) => {
 });
 
 const STREAM_NAME = 'order';
-const GROUP_NAME = 'order-workers';
+const GROUP_NAME = 'inventory-workers';
 const consumerName = process.argv[2] || 'worker-1';
 
 // Don't make this too small.
@@ -29,14 +29,12 @@ const consumerName = process.argv[2] || 'worker-1';
 const RECOVERY_IDLE_TIME = 30000;
 
 
-// --------------------------------------------------
 // PROCESS MESSAGE
-// --------------------------------------------------
 
 async function processMessage(message) {
     const messageID = message.id;
     const orderId = message.message.orderID;
-
+    console.log(message)
     const event_id = `order-${orderId}`
 
     const client = await pool.connect();
@@ -69,15 +67,11 @@ async function processMessage(message) {
         }
 
         // Process the order
-        const orderUpdate = await client.query(
-            `UPDATE orders
-             SET status = 'CONFIRMED'
-             WHERE id = $1`,
-            [orderId]
+        const orderDetails = await client.query(
+            `select product_id, quantity from order_items where order_id = $1`, [orderId]
         );
 
-        // console.log(orderUpdate)
-        if (orderUpdate.rowCount === 0) {
+        if (orderDetails.rows.length === 0) {
             console.log('Order not found:', orderId);
 
             await client.query('ROLLBACK');
@@ -86,6 +80,62 @@ async function processMessage(message) {
             // Message will remain pending and can be retried.
             return;
         }
+        let orderQuantity = orderDetails.rows[0].quantity
+        let product_id = orderDetails.rows[0].product_id
+
+        console.log("product_id: ", product_id)
+
+        const totalQuantity = await client.query(
+            `select quantity from inventory where product_id = $1`, [product_id]
+        )
+
+        if (totalQuantity.rows.length === 0) {
+            console.log('Product not found:', product_id);
+
+            await client.query('ROLLBACK');
+            return;
+        }
+
+        const currentStock = totalQuantity.rows[0].quantity
+        console.log(totalQuantity)
+
+        if (currentStock - orderQuantity < 0) {
+            console.log('Stock not available');
+
+            await client.query('ROLLBACK');
+
+            await redisClient.xAdd(
+                'order',
+                '*',
+                {
+                    event: 'inventory.failed',
+                    orderID: orderId.toString()
+                }
+            );
+
+            await redisClient.xAck(
+                STREAM_NAME,
+                GROUP_NAME,
+                messageID
+            );
+
+            return;
+        }
+
+        await client.query('update inventory set quantity = quantity - $1 where product_id = $2', [orderQuantity, product_id])
+
+        await redisClient.xAdd(
+            'order',
+            '*',
+            {
+                event: 'inventory.reserved',
+                orderID: orderId.toString()
+            }
+        );
+
+
+
+        // console.log(orderUpdate)
 
         // Record successful processing
         await client.query(
@@ -98,6 +148,8 @@ async function processMessage(message) {
         // DB work is now atomic
         await client.query('COMMIT');
 
+        // await redisClient.hIncrBy('metrics', 'order_confirmed', 1)
+
         // await new Promise(resolve => setTimeout(resolve, 40000))
         // ACK only AFTER DB commit
         await redisClient.xAck(
@@ -107,7 +159,7 @@ async function processMessage(message) {
         );
 
         console.log(
-            `Processed order ${orderId}, event ${event_id}`
+            `inventory reserved for order: ${orderId}, event ${event_id}`
         );
 
     } catch (error) {
@@ -174,9 +226,7 @@ async function processMessage(message) {
 }
 
 
-// --------------------------------------------------
 // NORMAL WORKER
-// --------------------------------------------------
 
 async function startWorker() {
     console.log(`Starting worker: ${consumerName}`);
@@ -204,6 +254,14 @@ async function startWorker() {
             const messages = result[0]?.messages || [];
 
             for (const message of messages) {
+                if (message.message.event !== 'order.created') {
+                    await redisClient.xAck(
+                        STREAM_NAME,
+                        GROUP_NAME,
+                        message.id
+                    );
+                    continue
+                }
                 await processMessage(message);
             }
 
@@ -223,9 +281,7 @@ async function startWorker() {
 }
 
 
-// --------------------------------------------------
 // RECOVER PENDING MESSAGES
-// --------------------------------------------------
 
 async function recoverPendingMessages() {
     try {
@@ -252,6 +308,14 @@ async function recoverPendingMessages() {
         );
 
         for (const message of claimedMessages) {
+            if (message.message.event !== 'order.created') {
+                await redisClient.xAck(
+                    STREAM_NAME,
+                    GROUP_NAME,
+                    message.id
+                );
+                continue;
+            }
             console.log(
                 'Processing recovered message:',
                 message.id
@@ -269,9 +333,7 @@ async function recoverPendingMessages() {
 }
 
 
-// --------------------------------------------------
 // START APPLICATION
-// --------------------------------------------------
 
 async function start() {
     try {
@@ -288,7 +350,7 @@ async function start() {
         );
 
         console.log(
-            `Order Worker Started: ${consumerName}`
+            `Inventory Worker Started: ${consumerName}`
         );
 
         // Start normal worker

@@ -58,7 +58,7 @@ async function start() {
         );
 
         // Start normal worker
-        startWorker();
+        process_failed_messages();
 
 
     } catch (error) {
